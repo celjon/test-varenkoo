@@ -2,6 +2,9 @@ from fastapi import FastAPI
 from app.database import init_db
 from app.api import operators, sources, contacts, leads
 
+# NOTE: This file was slightly updated as part of a test PR created by an AI assistant.
+# The change is non-functional and is used only to verify the integration workflow.
+
 app = FastAPI(
     title="Mini-CRM API",
     description="Lead distribution system between operators based on sources",
