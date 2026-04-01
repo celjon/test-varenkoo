@@ -1,12 +1,17 @@
-from sqlalchemy.orm import Session
-from sqlalchemy import func, case
-from app.models import Operator, Source, Lead, Contact, OperatorSourceWeight
-from app.schemas import (
-    OperatorCreate, OperatorUpdate, SourceCreate,
-    ContactCreate, SourceWeightsCreate
-)
 from typing import Optional, List
 import random
+
+from sqlalchemy import func, case
+from sqlalchemy.orm import Session
+
+from app.models import Operator, Source, Lead, Contact, OperatorSourceWeight
+from app.schemas import (
+    OperatorCreate,
+    OperatorUpdate,
+    SourceCreate,
+    ContactCreate,
+    SourceWeightsCreate,
+)
 
 
 class OperatorService:
@@ -27,7 +32,11 @@ class OperatorService:
         return db.query(Operator).filter(Operator.id == operator_id).first()
 
     @staticmethod
-    def update_operator(db: Session, operator_id: int, operator_data: OperatorUpdate) -> Optional[Operator]:
+    def update_operator(
+        db: Session,
+        operator_id: int,
+        operator_data: OperatorUpdate,
+    ) -> Optional[Operator]:
         operator = db.query(Operator).filter(Operator.id == operator_id).first()
         if not operator:
             return None
@@ -42,10 +51,14 @@ class OperatorService:
 
     @staticmethod
     def get_operator_current_load(db: Session, operator_id: int) -> int:
-        return db.query(Contact).filter(
-            Contact.operator_id == operator_id,
-            Contact.status != 'closed'
-        ).count()
+        return (
+            db.query(Contact)
+            .filter(
+                Contact.operator_id == operator_id,
+                Contact.status != "closed",
+            )
+            .count()
+        )
 
 
 class SourceService:
@@ -62,17 +75,23 @@ class SourceService:
         return db.query(Source).filter(Source.name == name).first()
 
     @staticmethod
-    def set_operator_weights(db: Session, source_id: int, weights_data: SourceWeightsCreate) -> bool:
+    def set_operator_weights(
+        db: Session,
+        source_id: int,
+        weights_data: SourceWeightsCreate,
+    ) -> bool:
         source = db.query(Source).filter(Source.id == source_id).first()
         if not source:
             return False
 
         db.query(OperatorSourceWeight).filter(
-            OperatorSourceWeight.source_id == source_id
+            OperatorSourceWeight.source_id == source_id,
         ).delete()
 
         for weight_item in weights_data.weights:
-            operator = db.query(Operator).filter(Operator.id == weight_item.operator_id).first()
+            operator = db.query(Operator).filter(
+                Operator.id == weight_item.operator_id,
+            ).first()
             if not operator:
                 db.rollback()
                 return False
@@ -80,7 +99,7 @@ class SourceService:
             weight_record = OperatorSourceWeight(
                 operator_id=weight_item.operator_id,
                 source_id=source_id,
-                weight=weight_item.weight
+                weight=weight_item.weight,
             )
             db.add(weight_record)
 
@@ -94,7 +113,9 @@ class LeadService:
         lead = None
 
         if contact_data.external_id:
-            lead = db.query(Lead).filter(Lead.external_id == contact_data.external_id).first()
+            lead = db.query(Lead).filter(
+                Lead.external_id == contact_data.external_id,
+            ).first()
 
         if not lead and contact_data.phone:
             lead = db.query(Lead).filter(Lead.phone == contact_data.phone).first()
@@ -107,7 +128,7 @@ class LeadService:
                 external_id=contact_data.external_id,
                 phone=contact_data.phone,
                 email=contact_data.email,
-                name=contact_data.name
+                name=contact_data.name,
             )
             db.add(lead)
             db.commit()
@@ -131,42 +152,81 @@ class LeadService:
         return db.query(Lead).all()
 
 
-class ContactService:
-    @staticmethod
-    def select_operator(db: Session, source_id: int) -> Optional[Operator]:
-        weights = db.query(OperatorSourceWeight).filter(
-            OperatorSourceWeight.source_id == source_id
-        ).all()
+class ContactAssignmentEngine:
+    """Инкапсулирует логику выбора оператора для контакта.
+
+    Класс выделен отдельно, чтобы:
+    - упростить тестирование распределения (можно мокать только этот класс),
+    - со временем вынести алгоритмы выбора операторов (например, разные стратегии).
+    """
+
+    def __init__(self, db: Session) -> None:
+        self._db = db
+
+    def select_operator_for_source(self, source_id: int) -> Optional[Operator]:
+        """Выбрать подходящего оператора для указанного источника.
+
+        Возвращает оператора или None, если никого назначить нельзя.
+        """
+
+        weights = (
+            self._db.query(OperatorSourceWeight)
+            .filter(OperatorSourceWeight.source_id == source_id)
+            .all()
+        )
 
         if not weights:
             return None
 
-        eligible_operators = []
+        eligible_operators = self._collect_eligible_operators(weights)
+        if not eligible_operators:
+            return None
+
+        return self._choose_by_weight(eligible_operators)
+
+    def _collect_eligible_operators(
+        self, weights: List[OperatorSourceWeight]
+    ) -> List[tuple[Operator, float]]:
+        """Отфильтровать операторов по активности и текущей нагрузке."""
+
+        eligible_operators: List[tuple[Operator, float]] = []
+
         for weight_record in weights:
             operator = weight_record.operator
             if not operator.is_active:
                 continue
 
-            current_load = OperatorService.get_operator_current_load(db, operator.id)
+            current_load = OperatorService.get_operator_current_load(
+                self._db,
+                operator.id,
+            )
             if current_load >= operator.max_load:
                 continue
 
             eligible_operators.append((operator, weight_record.weight))
 
-        if not eligible_operators:
-            return None
+        return eligible_operators
+
+    @staticmethod
+    def _choose_by_weight(
+        eligible_operators: List[tuple[Operator, float]],
+    ) -> Operator:
+        """Случайно выбрать оператора с учётом весов."""
 
         total_weight = sum(weight for _, weight in eligible_operators)
         random_value = random.uniform(0, total_weight)
 
-        cumulative_weight = 0
+        cumulative_weight = 0.0
         for operator, weight in eligible_operators:
             cumulative_weight += weight
             if random_value <= cumulative_weight:
                 return operator
 
+        # Фоллбек на случай погрешностей с плавающей точкой
         return eligible_operators[-1][0]
 
+
+class ContactService:
     @staticmethod
     def create_contact(db: Session, contact_data: ContactCreate) -> Contact:
         source = SourceService.get_source_by_name(db, contact_data.source_name)
@@ -175,14 +235,15 @@ class ContactService:
 
         lead = LeadService.find_or_create_lead(db, contact_data)
 
-        operator = ContactService.select_operator(db, source.id)
+        assignment_engine = ContactAssignmentEngine(db)
+        operator = assignment_engine.select_operator_for_source(source.id)
 
         contact = Contact(
             lead_id=lead.id,
             source_id=source.id,
             operator_id=operator.id if operator else None,
             message=contact_data.message,
-            status='new'
+            status="new",
         )
         db.add(contact)
         db.commit()
@@ -195,50 +256,66 @@ class StatisticsService:
     def get_statistics(db: Session) -> dict:
         total_contacts = db.query(Contact).count()
         total_leads = db.query(Lead).count()
-        contacts_with_operator = db.query(Contact).filter(Contact.operator_id.isnot(None)).count()
-        contacts_without_operator = db.query(Contact).filter(Contact.operator_id.is_(None)).count()
+        contacts_with_operator = db.query(Contact).filter(
+            Contact.operator_id.isnot(None),
+        ).count()
+        contacts_without_operator = db.query(Contact).filter(
+            Contact.operator_id.is_(None),
+        ).count()
 
-        operator_stats = db.query(
-            Operator.id,
-            Operator.name,
-            Operator.is_active,
-            Operator.max_load,
-            func.count(Contact.id).label('total_contacts'),
-            func.sum(case((Contact.status != 'closed', 1), else_=0)).label('active_contacts')
-        ).outerjoin(Contact, Operator.id == Contact.operator_id).group_by(Operator.id).all()
+        operator_stats = (
+            db.query(
+                Operator.id,
+                Operator.name,
+                Operator.is_active,
+                Operator.max_load,
+                func.count(Contact.id).label("total_contacts"),
+                func.sum(
+                    case((Contact.status != "closed", 1), else_=0),
+                ).label("active_contacts"),
+            )
+            .outerjoin(Contact, Operator.id == Contact.operator_id)
+            .group_by(Operator.id)
+            .all()
+        )
 
         operator_statistics = [
             {
-                'operator_id': stat.id,
-                'operator_name': stat.name,
-                'is_active': stat.is_active,
-                'max_load': stat.max_load,
-                'current_load': stat.active_contacts or 0,
-                'total_contacts': stat.total_contacts
+                "operator_id": stat.id,
+                "operator_name": stat.name,
+                "is_active": stat.is_active,
+                "max_load": stat.max_load,
+                "current_load": stat.active_contacts or 0,
+                "total_contacts": stat.total_contacts,
             }
             for stat in operator_stats
         ]
 
-        source_stats = db.query(
-            Source.id,
-            Source.name,
-            func.count(Contact.id).label('total_contacts')
-        ).outerjoin(Contact, Source.id == Contact.source_id).group_by(Source.id).all()
+        source_stats = (
+            db.query(
+                Source.id,
+                Source.name,
+                func.count(Contact.id).label("total_contacts"),
+            )
+            .outerjoin(Contact, Source.id == Contact.source_id)
+            .group_by(Source.id)
+            .all()
+        )
 
         source_statistics = [
             {
-                'source_id': stat.id,
-                'source_name': stat.name,
-                'total_contacts': stat.total_contacts
+                "source_id": stat.id,
+                "source_name": stat.name,
+                "total_contacts": stat.total_contacts,
             }
             for stat in source_stats
         ]
 
         return {
-            'total_contacts': total_contacts,
-            'total_leads': total_leads,
-            'contacts_with_operator': contacts_with_operator,
-            'contacts_without_operator': contacts_without_operator,
-            'operator_statistics': operator_statistics,
-            'source_statistics': source_statistics
+            "total_contacts": total_contacts,
+            "total_leads": total_leads,
+            "contacts_with_operator": contacts_with_operator,
+            "contacts_without_operator": contacts_without_operator,
+            "operator_statistics": operator_statistics,
+            "source_statistics": source_statistics,
         }
